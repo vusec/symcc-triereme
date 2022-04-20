@@ -14,7 +14,7 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use regex::Regex;
-use std::cmp;
+use serde::Serializer;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -38,54 +38,6 @@ fn insert_input_file<S: AsRef<OsStr>, P: AsRef<Path>>(
     }
 
     fixed_command
-}
-
-/// A coverage map as used by AFL.
-pub struct AflMap {
-    data: [u8; 65536],
-}
-
-impl AflMap {
-    /// Create an empty map.
-    pub fn new() -> AflMap {
-        AflMap { data: [0; 65536] }
-    }
-
-    /// Load a map from disk.
-    pub fn load(path: impl AsRef<Path>) -> Result<AflMap> {
-        let data = fs::read(&path).with_context(|| {
-            format!(
-                "Failed to read the AFL bitmap that \
-                 afl-showmap should have generated at {}",
-                path.as_ref().display()
-            )
-        })?;
-        ensure!(
-            data.len() == 65536,
-            "The file to load the coverage map from has the wrong size ({})",
-            data.len()
-        );
-
-        let mut result = AflMap::new();
-        result.data.copy_from_slice(&data);
-        Ok(result)
-    }
-
-    /// Merge with another coverage map in place.
-    ///
-    /// Return true if the map has changed, i.e., if the other map yielded new
-    /// coverage.
-    pub fn merge(&mut self, other: &AflMap) -> bool {
-        let mut interesting = false;
-        for (known, new) in self.data.iter_mut().zip(other.data.iter()) {
-            if *known != (*known | new) {
-                *known |= new;
-                interesting = true;
-            }
-        }
-
-        interesting
-    }
 }
 
 /// Score of a test case.
@@ -181,6 +133,7 @@ pub fn copy_testcase(
     testcase: impl AsRef<Path>,
     target_dir: &mut TestcaseDir,
     parent: impl AsRef<Path>,
+    relative_time: u64,
 ) -> Result<()> {
     let orig_name = parent
         .as_ref()
@@ -194,7 +147,10 @@ pub fn copy_testcase(
     );
 
     if let Some(orig_id) = orig_name.get(3..9) {
-        let new_name = format!("id:{:06},src:{}", target_dir.current_id, &orig_id);
+        let new_name = format!(
+            "id:{:06},src:{},time:{}",
+            target_dir.current_id, &orig_id, relative_time
+        );
         let target = target_dir.path.join(new_name);
         log::debug!("Creating test case {}", target.display());
         fs::copy(testcase.as_ref(), target).with_context(|| {
@@ -221,30 +177,14 @@ pub fn copy_testcase(
 /// This should not change during execution.
 #[derive(Debug)]
 pub struct AflConfig {
-    /// The location of the afl-showmap program.
-    show_map: PathBuf,
-
     /// The command that AFL uses to invoke the target program.
-    target_command: Vec<OsString>,
+    target: OsString,
 
-    /// Do we need to pass data to standard input?
-    use_standard_input: bool,
-
-    /// Are we using AFL's QEMU mode?
-    use_qemu_mode: bool,
+    /// The args that AFL uses to invoke the target program.
+    target_args: Vec<OsString>,
 
     /// The fuzzer instance's queue of test cases.
     queue: PathBuf,
-}
-
-/// Possible results of afl-showmap.
-pub enum AflShowmapResult {
-    /// The map was created successfully.
-    Success(Box<AflMap>),
-    /// The target timed out or failed to execute.
-    Hang,
-    /// The target crashed.
-    Crash,
 }
 
 impl AflConfig {
@@ -276,31 +216,25 @@ impl AflConfig {
             .trim()
             .split_whitespace()
             .collect();
-        let afl_target_command: Vec<_> = afl_command
+
+        let mut afl_target_command: Vec<_> = afl_command
             .iter()
             .skip_while(|s| **s != "--")
+            .skip(1)
             .map(OsString::from)
             .collect();
-        let afl_binary_dir = Path::new(
-            afl_command
-                .get(0)
-                .expect("The AFL command is unexpectedly short"),
-        )
-        .parent()
-        .unwrap();
+        let target_args = afl_target_command.split_off(1);
 
         Ok(AflConfig {
-            show_map: afl_binary_dir.join("afl-showmap"),
-            use_standard_input: !afl_target_command.contains(&"@@".into()),
-            use_qemu_mode: afl_command.contains(&"-Q".into()),
-            target_command: afl_target_command,
+            target: afl_target_command.pop().unwrap(),
+            target_args,
             queue: fuzzer_output.as_ref().join("queue"),
         })
     }
 
     /// Return the most promising unseen test case of this fuzzer.
-    pub fn best_new_testcase(&self, seen: &HashSet<PathBuf>) -> Result<Option<PathBuf>> {
-        let best = fs::read_dir(&self.queue)
+    pub fn best_new_testcase(&self, seen: &HashSet<PathBuf>) -> Result<(Option<PathBuf>, u64)> {
+        let candidates: Vec<_> = fs::read_dir(&self.queue)
             .with_context(|| {
                 format!(
                     "Failed to open the fuzzer's queue at {}",
@@ -317,70 +251,23 @@ impl AflConfig {
             .into_iter()
             .map(|entry| entry.path())
             .filter(|path| path.is_file() && !seen.contains(path))
+            .collect();
+
+        let num_candidates = candidates.len() as u64;
+
+        let best = candidates
+            .into_iter()
             .max_by_key(|path| TestcaseScore::new(path));
 
-        Ok(best)
+        Ok((best, num_candidates))
     }
 
-    pub fn run_showmap(
-        &self,
-        testcase_bitmap: impl AsRef<Path>,
-        testcase: impl AsRef<Path>,
-    ) -> Result<AflShowmapResult> {
-        let mut afl_show_map = Command::new(&self.show_map);
+    pub fn get_target(&self) -> &OsString {
+        &self.target
+    }
 
-        if self.use_qemu_mode {
-            afl_show_map.arg("-Q");
-        }
-
-        afl_show_map
-            .args(&["-t", "5000", "-m", "none", "-b", "-o"])
-            .arg(testcase_bitmap.as_ref())
-            .args(insert_input_file(&self.target_command, &testcase))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(if self.use_standard_input {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            });
-
-        log::debug!("Running afl-showmap as follows: {:?}", &afl_show_map);
-        let mut afl_show_map_child = afl_show_map.spawn().context("Failed to run afl-showmap")?;
-
-        if self.use_standard_input {
-            io::copy(
-                &mut File::open(&testcase)?,
-                afl_show_map_child
-                    .stdin
-                    .as_mut()
-                    .expect("Failed to open the stardard input of afl-showmap"),
-            )
-            .context("Failed to pipe the test input to afl-showmap")?;
-        }
-
-        let afl_show_map_status = afl_show_map_child
-            .wait()
-            .context("Failed to wait for afl-showmap")?;
-        log::debug!("afl-showmap returned {}", &afl_show_map_status);
-        match afl_show_map_status
-            .code()
-            .expect("No exit code available for afl-showmap")
-        {
-            0 => {
-                let map = AflMap::load(&testcase_bitmap).with_context(|| {
-                    format!(
-                        "Failed to read the AFL bitmap that \
-                         afl-showmap should have generated at {}",
-                        testcase_bitmap.as_ref().display()
-                    )
-                })?;
-                Ok(AflShowmapResult::Success(Box::new(map)))
-            }
-            1 => Ok(AflShowmapResult::Hang),
-            2 => Ok(AflShowmapResult::Crash),
-            unexpected => panic!("Unexpected return code {} from afl-showmap", unexpected),
-        }
+    pub fn get_args(&self) -> &[OsString] {
+        &self.target_args
     }
 }
 
@@ -400,6 +287,85 @@ pub struct SymCC {
     command: Vec<OsString>,
 }
 
+fn serialize_duration_micros<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_u128(duration.as_micros())
+}
+
+#[derive(serde::Serialize, Default, PartialEq, Eq, Debug)]
+pub struct QSymStats {
+    pub testcase: String,
+    #[serde(rename = "total_time_us", serialize_with = "serialize_duration_micros")]
+    pub total_time: Duration,
+    #[serde(rename = "push_time_us", serialize_with = "serialize_duration_micros")]
+    pub push_time: Duration,
+    #[serde(rename = "pop_time_us", serialize_with = "serialize_duration_micros")]
+    pub pop_time: Duration,
+    #[serde(rename = "reset_time_us", serialize_with = "serialize_duration_micros")]
+    pub reset_time: Duration,
+    #[serde(
+        rename = "assert_time_us",
+        serialize_with = "serialize_duration_micros"
+    )]
+    pub assert_time: Duration,
+    #[serde(rename = "check_time_us", serialize_with = "serialize_duration_micros")]
+    pub check_time: Duration,
+    pub killed: bool,
+    pub unsat_count: u64,
+    pub sat_count: u64,
+    pub unknown_count: u64,
+}
+
+impl QSymStats {
+    pub fn from_log_entry(log_entry: &str, testcase: String, killed: bool) -> Option<Self> {
+        let re = Regex::new(concat!(
+            r#"\{ "total_time": (\d+)"#,
+            r#", "push_time": (\d+)"#,
+            r#", "pop_time": (\d+)"#,
+            r#", "reset_time": (\d+)"#,
+            r#", "assert_time": (\d+)"#,
+            r#", "check_time": (\d+)"#,
+            r#", "unsat_count": (\d+)"#,
+            r#", "sat_count": (\d+)"#,
+            r#", "unknown_count": (\d+)"#,
+            r#" \}"#
+        ))
+        .unwrap();
+
+        let captures = re.captures(log_entry)?;
+
+        let total_time = Duration::from_micros(captures[1].parse().unwrap());
+        let push_time = Duration::from_micros(captures[2].parse().unwrap());
+        let pop_time = Duration::from_micros(captures[3].parse().unwrap());
+        let reset_time = Duration::from_micros(captures[4].parse().unwrap());
+        let assert_time = Duration::from_micros(captures[5].parse().unwrap());
+        let check_time = Duration::from_micros(captures[6].parse().unwrap());
+        let unsat_count = captures[7].parse().unwrap();
+        let sat_count = captures[8].parse().unwrap();
+        let unknown_count = captures[9].parse().unwrap();
+
+        Some(Self {
+            testcase,
+            total_time,
+            push_time,
+            pop_time,
+            reset_time,
+            assert_time,
+            check_time,
+            unsat_count,
+            sat_count,
+            unknown_count,
+            killed,
+        })
+    }
+
+    pub fn get_solver_time(&self) -> Duration {
+        self.push_time + self.pop_time + self.reset_time + self.assert_time + self.check_time
+    }
+}
+
 /// The result of executing SymCC.
 pub struct SymCCResult {
     /// The generated test cases.
@@ -408,8 +374,8 @@ pub struct SymCCResult {
     pub killed: bool,
     /// The total time taken by the execution.
     pub time: Duration,
-    /// The time spent in the solver (Qsym backend only).
-    pub solver_time: Option<Duration>,
+    /// Statistics reported by the QSYM backend
+    pub qsym_stats: Option<QSymStats>,
 }
 
 impl SymCC {
@@ -427,23 +393,17 @@ impl SymCC {
 
     /// Try to extract the solver time from the logs produced by the Qsym
     /// backend.
-    fn parse_solver_time(output: Vec<u8>) -> Option<Duration> {
-        let re = Regex::new(r#""solving_time": (\d+)"#).unwrap();
-        output
+    fn parse_qsym_stats(output: Vec<u8>, testcase: String, killed: bool) -> Option<QSymStats> {
+        let qsym_stats_raw = output
             // split into lines
             .rsplit(|n| *n == b'\n')
             // convert to string
             .filter_map(|s| str::from_utf8(s).ok())
             // check that it's an SMT log line
-            .filter(|s| s.trim_start().starts_with("[STAT] SMT:"))
-            // find the solving_time element
-            .filter_map(|s| re.captures(s))
-            // convert the time to an integer
-            .filter_map(|c| c[1].parse().ok())
-            // associate the integer with a unit
-            .map(Duration::from_micros)
-            // get the first one
-            .next()
+            .find(|s| s.trim_start().starts_with("[STAT] SMT:"))?;
+
+        // parse QSym stats
+        QSymStats::from_log_entry(qsym_stats_raw, testcase, killed)
     }
 
     /// Run SymCC on the given input, writing results to the provided temporary
@@ -546,16 +506,22 @@ impl SymCC {
             .map(|entry| entry.path())
             .collect();
 
-        let solver_time = SymCC::parse_solver_time(result.stderr);
-        if solver_time.is_some() && solver_time.unwrap() > total_time {
-            log::warn!("Backend reported inaccurate solver time!");
-        }
+        let qsym_stats = SymCC::parse_qsym_stats(
+            result.stderr,
+            input
+                .as_ref()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            killed,
+        );
 
         Ok(SymCCResult {
             test_cases: new_tests,
             killed,
             time: total_time,
-            solver_time: solver_time.map(|t| cmp::min(t, total_time)),
+            qsym_stats,
         })
     }
 }
@@ -595,19 +561,26 @@ mod tests {
 
     #[test]
     fn test_solver_time_parsing() {
-        let output = r#"[INFO] New testcase: /tmp/output/000005
-[STAT] SMT: { "solving_time": 14539, "total_time": 185091 }
-[STAT] SMT: { "solving_time": 14869 }
-[STAT] SMT: { "solving_time": 14869, "total_time": 185742 }
-[STAT] SMT: { "solving_time": 15106 }"#;
+        let output = r#"This is SymCC running with the QSYM backend
+Making data read from /tmp/yolo as symbolic
+[STAT] SMT: { "total_time": 36088, "push_time": 0, "pop_time": 0, "reset_time": 20, "assert_time": 415, "check_time": 391, "unsat_count": 1, "sat_count": 2, "unknown_count": 3 }
+[INFO] New testcase: /tmp/output/000000"#;
 
         assert_eq!(
-            SymCC::parse_solver_time(output.as_bytes().to_vec()),
-            Some(Duration::from_micros(15106))
-        );
-        assert_eq!(
-            SymCC::parse_solver_time("whatever".as_bytes().to_vec()),
-            None
+            SymCC::parse_qsym_stats(output.as_bytes().to_vec(), "abc".to_string(), false),
+            Some(QSymStats {
+                testcase: String::from("abc"),
+                total_time: Duration::from_micros(36088),
+                push_time: Duration::from_micros(0),
+                pop_time: Duration::from_micros(0),
+                reset_time: Duration::from_micros(20),
+                assert_time: Duration::from_micros(415),
+                check_time: Duration::from_micros(391),
+                killed: false,
+                unsat_count: 1,
+                sat_count: 2,
+                unknown_count: 3,
+            })
         );
     }
 }
